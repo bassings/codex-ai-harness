@@ -26,13 +26,20 @@ durable source of truth; chat memory is not.
    conductor log entry. External writes such as pushes and PR creation require
    that the user's request includes that delivery scope.
 6. If waiting, use an available background wait or monitoring mechanism, keep
-   the task active, and record the wait on the task's own checklist line as
+   the task active, and record the wait by replacing the task's existing
+   `— state:` segment (not adding another one alongside it; only the newest
+   `(since <timestamp>)` on the line is honoured) with
    `— state: <status> (since <UTC timestamp>)`, for example
-   `— state: awaiting-ci #12 (since 2026-09-19T05:10Z)`. Use the current UTC
-   time, ISO-8601 with a trailing `Z`. This is the only place a wait is
-   recorded; write it every time a wait begins, not only the first time. If a
-   human decision is genuinely required, write `<plan path>: <question>` to
-   `.codex/blocked-on-human` and ask exactly that question.
+   `— state: awaiting-ci #12 (since 2026-09-19T05:10:00+00:00)`. Use the
+   current time with an explicit UTC offset (a trailing `Z`, or `+00:00`); a
+   timestamp with no offset at all is refused. This is the only place a wait
+   is recorded; write it every time a wait begins, not only the first time.
+   If a human decision is genuinely required, write `<plan path>: <question>`
+   to `.codex/blocked-on-human` and ask exactly that question. The moment the
+   human answers, delete `.codex/blocked-on-human` immediately, before acting
+   on the answer: the guard also stops honouring a note older than a day on
+   its own, but a stale, un-deleted note left in place for under a day still
+   silently parks the plan.
 7. When all tasks are merged or otherwise completed, remove the two state
    files and append a `conduct_plan_event` ledger event with outcome `done`.
 
@@ -43,13 +50,14 @@ measured state, action taken, and next wake condition.
 
 `hooks/plan_guard_stop.py` is a Codex Stop hook: it runs on every attempt to
 end a turn. While `.codex/active-plan` names this plan and it still has
-unticked `- [ ]` tasks, it refuses the stop unless the plan is genuinely
-covered: a task line carries a `(since <timestamp>)` wait recorded within the
-last hour, or `.codex/blocked-on-human` names this plan. So step 6 above is
-not optional housekeeping: an unrecorded wait or an unrecorded human block
-means the next stop is refused. The hook reads only the active-plan marker,
-the blocked-on-human note and Codex's own `stop_hook_active` flag; it never
-reads the ledger, so nothing here depends on a ledger row being written.
+unticked open tasks, it refuses the stop unless the plan is genuinely
+covered: an open task's line carries a `(since <timestamp>)` wait recorded
+within the last hour, or `.codex/blocked-on-human` names this plan and is
+under a day old. So step 6 above is not optional housekeeping: an unrecorded
+wait or an unrecorded, undeleted human block means the next stop is refused.
+The hook reads only the active-plan marker, the blocked-on-human note and
+Codex's own `stop_hook_active` flag; it never reads the ledger, so nothing
+here depends on a ledger row being written.
 
 ## The fix loop is bounded, and it escalates
 
