@@ -482,6 +482,50 @@ class DecideTests(unittest.TestCase):
             reason, note = hook.decide({}, root, NOW)
             self.assertIsNone(reason)
 
+    def test_note_matches_when_the_plan_is_in_a_directory_whose_name_has_a_colon(self):
+        # A colon inside a DIRECTORY component, not just a filename, must
+        # still resolve correctly once the loop stops at the first colon
+        # followed by whitespace (the fix below): "dir" alone does not
+        # resolve to the plan, so the loop must continue past it to the
+        # real delimiter after "PLAN.md".
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            init_repo(root)
+            (root / "dir:x").mkdir()
+            write_plan(root, "dir:x/PLAN.md", "- [ ] C1: build the thing\n")
+            write_marker(root, "dir:x/PLAN.md")
+            write_note(root, "dir:x/PLAN.md: q", NOW)
+            reason, note = hook.decide({}, root, NOW)
+            self.assertIsNone(reason)
+
+    # -- Fix, owner-approved: round 3's "try every colon" let a note
+    # -- written for ANOTHER plan exempt THIS one, when the other note's
+    # -- own free-text question happened to contain a "../" path to this
+    # -- plan followed by a colon. Path.resolve() collapses ".." lexically
+    # -- even through a component that does not exist, so a later, bogus
+    # -- candidate spanning past the real delimiter could resolve to the
+    # -- real plan path. The fix: stop trying colons once one is followed
+    # -- by whitespace, since that is the real "<path>: <question>" split.
+    def test_note_for_another_plan_with_a_dotdot_path_to_this_plan_does_not_exempt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            init_repo(root)
+            write_plan(root, "PLAN.md", "- [ ] C1: build the thing\n")
+            write_marker(root, "PLAN.md")
+            write_note(root, "OTHER.md: waiting on docs/../PLAN.md: ok?", NOW)
+            reason, note = hook.decide({}, root, NOW)
+            self.assertIsNotNone(reason)  # must still block; the note is for OTHER.md
+
+    def test_note_for_another_plan_with_a_url_style_dotdot_path_does_not_exempt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            init_repo(root)
+            write_plan(root, "PLAN.md", "- [ ] C1: build the thing\n")
+            write_marker(root, "PLAN.md")
+            write_note(root, "OTHER.md: see http://x/../../PLAN.md: q", NOW)
+            reason, note = hook.decide({}, root, NOW)
+            self.assertIsNotNone(reason)  # must still block; the note is for OTHER.md
+
     # -- item 5: a wait only counts on an open task's own line.
     def test_wait_on_a_ticked_task_does_not_exempt_a_different_open_task(self):
         with tempfile.TemporaryDirectory() as tmp:

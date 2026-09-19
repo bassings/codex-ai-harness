@@ -274,13 +274,24 @@ def note_names_plan(root: Path, plan_path: Path, now: dt.datetime) -> bool:
     """Whether .codex/blocked-on-human is live and declares this plan.
 
     "Live" means: not a symlink, its age within [-FUTURE_TOLERANCE,
-    NOTE_MAX_AGE] of now (round 3, item 4: a future-dated note is not
-    honoured forever either), and some prefix of its text -- split at
-    each ':' in turn, accepting the first one that resolves to
-    plan_path -- names this plan. Trying every colon (round 3, item 6)
-    rather than guessing a fixed delimiter is what lets "PLAN.md:
-    question" with no space, a path containing its own colon, and the
-    question on the next line all work without a special case each.
+    NOTE_MAX_AGE] of now (a future-dated note is not honoured forever
+    either), and some prefix of its text -- split at each ':' in turn,
+    accepting the first one that resolves to plan_path -- names this
+    plan. Trying every colon rather than guessing a fixed delimiter is
+    what lets "PLAN.md: question" with no space, a path containing its
+    own colon, and the question on the next line all work without a
+    special case each.
+
+    The loop stops at the first colon followed by whitespace, even when
+    that candidate does not match. Without that stop, a note written for
+    a DIFFERENT plan could exempt this one: Path.resolve() collapses a
+    ".." lexically even through a path component that never existed on
+    disk, so a later, bogus candidate spanning past the real delimiter
+    and into the note's own free-text question -- for example
+    "OTHER.md: waiting on docs/../PLAN.md: ok?" -- could resolve straight
+    back to this plan's real path. The real "<path>: <question>"
+    delimiter is always the first colon-then-whitespace, so nothing past
+    it can legitimately be part of the declared path.
     """
     note = root / NOTE_RELATIVE
     if note.is_symlink() or not note.is_file():
@@ -309,6 +320,8 @@ def note_names_plan(root: Path, plan_path: Path, now: dt.datetime) -> bool:
         declared_path = resolve_within_root(root, candidate)
         if declared_path is not None and declared_path == plan_path:
             return True
+        if text[index + 1:index + 2].isspace():
+            break  # the first colon followed by whitespace ends the declared path
     return False
 
 
