@@ -31,11 +31,14 @@ same stdin contract, short of Codex's own process supervision.
 Scratch repo: `git init`, then `specs/PLAN.md` containing one open task
 (`- [ ] C1: build the thing`) and `.codex/active-plan` containing
 `specs/PLAN.md`. No `.codex/blocked-on-human` note, no wait recorded on the
-task line, `stop_hook_active` false.
+task line, `stop_hook_active` false. Re-run 2026-09-19 against the round-3
+implementation (fence-awareness removed, rejected-wait wording, bounded
+output); the quote below replaces an earlier round's, which the code no
+longer prints.
 
 ```
 $ echo "$PAYLOAD" | python3 plan_guard_stop.py
-{"decision": "block", "reason": "Codex plan guard: 1 open task(s) (C1) have no recorded wait and the plan is not parked on a human decision. Record a wait on the open task's own line as \"state: <status> (since <UTC timestamp>)\", write .codex/blocked-on-human as \"<plan path>: <question>\", or tick the remaining tasks before stopping."}
+{"decision": "block", "reason": "Codex plan guard: 1 open task(s) (C1) have no recorded wait and the plan is not parked on a human decision. Record a wait by replacing the open task's \"state:\" segment with, for example, \"state: awaiting-ci #1 (since 2026-09-19T05:55:00+00:00)\"; write .codex/blocked-on-human as \"<plan path>: <question>\"; or tick the remaining tasks before stopping."}
 exit: 0
 ```
 

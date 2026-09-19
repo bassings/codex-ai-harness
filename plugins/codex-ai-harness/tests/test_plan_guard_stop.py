@@ -6,7 +6,9 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -42,6 +44,22 @@ def write_plan(root: Path, name: str, body: str) -> Path:
     path = root / name
     path.write_text(body)
     return path
+
+
+def write_note(root: Path, text: str, now: dt.datetime, age: dt.timedelta = dt.timedelta(0)) -> Path:
+    """Write .codex/blocked-on-human with its mtime pinned to now - age.
+
+    Round 3, item 4: every note test sets its mtime explicitly relative to
+    NOW rather than relying on "just created", so age-boundary tests are
+    exact and reproducible.
+    """
+    note_dir = root / ".codex"
+    note_dir.mkdir(parents=True, exist_ok=True)
+    note = note_dir / "blocked-on-human"
+    note.write_text(text)
+    stamp = (now - age).timestamp()
+    os.utime(note, (stamp, stamp))
+    return note
 
 
 class DecideTests(unittest.TestCase):
@@ -94,9 +112,7 @@ class DecideTests(unittest.TestCase):
             write_plan(root, "PLAN-A.md", "- [ ] C1: build the thing\n")
             write_plan(root, "PLAN-B.md", "- [ ] K1: other work\n")
             write_marker(root, "PLAN-A.md")
-            (root / ".codex" / "blocked-on-human").write_text(
-                "PLAN-B.md: waiting on the owner"
-            )
+            write_note(root, "PLAN-B.md: waiting on the owner", NOW)
             reason, note = hook.decide({}, root, NOW)
             self.assertIsNotNone(reason)  # AC-C5-1, AC-DATA-12
 
@@ -123,9 +139,7 @@ class DecideTests(unittest.TestCase):
             init_repo(root)
             write_plan(root, "PLAN.md", "- [ ] C1: build the thing\n")
             write_marker(root, "PLAN.md")
-            (root / ".codex" / "blocked-on-human").write_text(
-                "PLAN.md: waiting on the owner"
-            )
+            write_note(root, "PLAN.md: waiting on the owner", NOW)
             reason, note = hook.decide({}, root, NOW)
             self.assertIsNone(reason)
 
@@ -178,10 +192,7 @@ class DecideTests(unittest.TestCase):
             init_repo(root)
             write_plan(root, "PLAN.md", "- [ ] C1: build the thing\n")
             write_marker(root, "PLAN.md")
-            note = root / ".codex" / "blocked-on-human"
-            note.write_text("PLAN.md: waiting on the owner")
-            nine_days_ago = (NOW - dt.timedelta(days=9)).timestamp()
-            os.utime(note, (nine_days_ago, nine_days_ago))
+            write_note(root, "PLAN.md: waiting on the owner", NOW, age=dt.timedelta(days=9))
             reason, stderr_note = hook.decide({}, root, NOW)
             self.assertIsNotNone(reason)
 
@@ -295,6 +306,71 @@ class DecideTests(unittest.TestCase):
             reason, note = hook.decide({}, root, NOW)
             self.assertIsNone(reason)
 
+    # -- Round 3, item 3: a rejected stamp says so in the reason, and a
+    # -- leftover future stamp cannot hide a fresh, valid one on the same
+    # -- line (latest_wait must discard far-future candidates before
+    # -- taking max, not after).
+    def test_reason_reports_a_rejected_future_wait_stamp(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            init_repo(root)
+            way_future = (NOW + dt.timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            write_plan(
+                root, "PLAN.md",
+                f"- [ ] C1: build the thing — state: awaiting-ci #1 "
+                f"(since {way_future})\n",
+            )
+            write_marker(root, "PLAN.md")
+            reason, note = hook.decide({}, root, NOW)
+            self.assertIsNotNone(reason)
+            self.assertIn("rejected", reason)
+            self.assertIn("in the future", reason)
+
+    def test_reason_reports_a_rejected_wait_stamp_with_no_zone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            init_repo(root)
+            write_plan(
+                root, "PLAN.md",
+                "- [ ] C1: build the thing — state: awaiting-ci #1 "
+                "(since 2026-09-19T05:55:00)\n",
+            )
+            write_marker(root, "PLAN.md")
+            reason, note = hook.decide({}, root, NOW)
+            self.assertIsNotNone(reason)
+            self.assertIn("rejected", reason)
+            self.assertIn("no UTC offset", reason)
+
+    def test_future_stamp_does_not_hide_a_fresh_valid_stamp_on_the_same_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            init_repo(root)
+            fresh = (NOW - dt.timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            way_future = (NOW + dt.timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            write_plan(
+                root, "PLAN.md",
+                f"- [ ] C1: build the thing — state: awaiting-ci #1 "
+                f"(since {way_future}) (since {fresh})\n",
+            )
+            write_marker(root, "PLAN.md")
+            reason, note = hook.decide({}, root, NOW)
+            self.assertIsNone(reason)
+
+    # -- Round 3, item 5: SINCE_RE is bounded so an unterminated "(since"
+    # -- repeated many times cannot make matching slow.
+    def test_since_regex_stays_fast_on_a_huge_unterminated_repeated_pattern(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            init_repo(root)
+            chunk = "(since 2026-09-19T0"
+            huge_line = "- [ ] C1: build the thing " + chunk * (380 * 1024 // len(chunk))
+            write_plan(root, "PLAN.md", huge_line + "\n")
+            write_marker(root, "PLAN.md")
+            start = time.perf_counter()
+            reason, note = hook.decide({}, root, NOW)
+            elapsed = time.perf_counter() - start
+            self.assertLess(elapsed, 1.0)
+
     # -- item 4: note matching.
     def test_note_split_uses_colon_space_so_a_colon_in_the_plan_path_survives(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -303,9 +379,7 @@ class DecideTests(unittest.TestCase):
             (root / "specs").mkdir()
             write_plan(root, "specs/2026:09:19-plan.md", "- [ ] C1: build the thing\n")
             write_marker(root, "specs/2026:09:19-plan.md")
-            (root / ".codex" / "blocked-on-human").write_text(
-                "specs/2026:09:19-plan.md: waiting on the owner"
-            )
+            write_note(root, "specs/2026:09:19-plan.md: waiting on the owner", NOW)
             reason, note = hook.decide({}, root, NOW)
             self.assertIsNone(reason)
 
@@ -315,9 +389,7 @@ class DecideTests(unittest.TestCase):
             init_repo(root)
             write_plan(root, "PLAN.md", "- [ ] C1: build the thing\n")
             write_marker(root, "PLAN.md")
-            (root / ".codex" / "blocked-on-human").write_text(
-                "./PLAN.md: waiting on the owner"
-            )
+            write_note(root, "./PLAN.md: waiting on the owner", NOW)
             reason, note = hook.decide({}, root, NOW)
             self.assertIsNone(reason)
 
@@ -327,9 +399,7 @@ class DecideTests(unittest.TestCase):
             init_repo(root)
             write_plan(root, "PLAN.md", "- [ ] C1: build the thing\n")
             write_marker(root, "PLAN.md")
-            (root / ".codex" / "blocked-on-human").write_text(
-                f"{root / 'PLAN.md'}: waiting on the owner"
-            )
+            write_note(root, f"{root / 'PLAN.md'}: waiting on the owner", NOW)
             reason, note = hook.decide({}, root, NOW)
             self.assertIsNone(reason)
 
@@ -339,9 +409,7 @@ class DecideTests(unittest.TestCase):
             init_repo(root)
             write_plan(root, "PLAN.md", "- [ ] C1: build the thing\n")
             write_marker(root, "PLAN.md")
-            (root / ".codex" / "blocked-on-human").write_bytes(
-                "﻿PLAN.md: waiting on the owner".encode("utf-8")
-            )
+            write_note(root, "﻿PLAN.md: waiting on the owner", NOW)
             reason, note = hook.decide({}, root, NOW)
             self.assertIsNone(reason)
 
@@ -351,9 +419,66 @@ class DecideTests(unittest.TestCase):
             init_repo(root)
             write_plan(root, "PLAN.md", "- [ ] C1: build the thing\n")
             write_marker(root, "PLAN.md")
-            (root / ".codex" / "blocked-on-human").write_text(
-                "`PLAN.md`: waiting on the owner"
+            write_note(root, "`PLAN.md`: waiting on the owner", NOW)
+            reason, note = hook.decide({}, root, NOW)
+            self.assertIsNone(reason)
+
+    # -- Round 3, item 4: 0 <= now - mtime <= 24h, with 5 minutes of
+    # -- allowance for clock skew at the future edge, so a future-dated
+    # -- note is not honoured indefinitely either.
+    def test_note_23_hours_old_still_allows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            init_repo(root)
+            write_plan(root, "PLAN.md", "- [ ] C1: build the thing\n")
+            write_marker(root, "PLAN.md")
+            write_note(root, "PLAN.md: waiting on the owner", NOW, age=dt.timedelta(hours=23))
+            reason, note = hook.decide({}, root, NOW)
+            self.assertIsNone(reason)
+
+    def test_note_25_hours_old_blocks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            init_repo(root)
+            write_plan(root, "PLAN.md", "- [ ] C1: build the thing\n")
+            write_marker(root, "PLAN.md")
+            write_note(root, "PLAN.md: waiting on the owner", NOW, age=dt.timedelta(hours=25))
+            reason, note = hook.decide({}, root, NOW)
+            self.assertIsNotNone(reason)
+
+    def test_note_dated_two_hours_in_the_future_is_not_honoured(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            init_repo(root)
+            write_plan(root, "PLAN.md", "- [ ] C1: build the thing\n")
+            write_marker(root, "PLAN.md")
+            write_note(
+                root, "PLAN.md: waiting on the owner", NOW, age=-dt.timedelta(hours=2)
             )
+            reason, note = hook.decide({}, root, NOW)
+            self.assertIsNotNone(reason)
+
+    # -- Round 3, item 6: try each ':' position in turn and accept the
+    # -- first prefix that resolves to the plan path, so a note with no
+    # -- space after the colon, or its question on the next line, both
+    # -- still match.
+    def test_note_matches_with_no_space_after_the_colon(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            init_repo(root)
+            write_plan(root, "PLAN.md", "- [ ] C1: build the thing\n")
+            write_marker(root, "PLAN.md")
+            write_note(root, "PLAN.md:waiting on the owner", NOW)
+            reason, note = hook.decide({}, root, NOW)
+            self.assertIsNone(reason)
+
+    def test_note_matches_with_the_question_on_the_next_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            init_repo(root)
+            write_plan(root, "PLAN.md", "- [ ] C1: build the thing\n")
+            write_marker(root, "PLAN.md")
+            write_note(root, "PLAN.md:\nWhat should we do about the vendor pin?", NOW)
             reason, note = hook.decide({}, root, NOW)
             self.assertIsNone(reason)
 
@@ -408,9 +533,7 @@ class DecideTests(unittest.TestCase):
             write_plan(root, "PLAN-A.md", "- [ ] C1: build the thing\n")
             write_plan(root, "PLAN-B.md", "- [ ] K1: other\n")
             write_marker(root, "PLAN-A.md")
-            (root / ".codex" / "blocked-on-human").write_text(
-                "PLAN-B.md: does PLAN-A.md need anything?"
-            )
+            write_note(root, "PLAN-B.md: does PLAN-A.md need anything?", NOW)
             reason, note = hook.decide({}, root, NOW)
             self.assertIsNotNone(reason)
 
@@ -458,17 +581,102 @@ class DecideTests(unittest.TestCase):
             reason, note = hook.decide({}, root, NOW)
             self.assertIsNotNone(reason)
 
-    def test_open_task_like_line_inside_fenced_code_block_is_ignored(self):
+    # -- Round 3, item 1: fence-awareness removed entirely. Round 2's own
+    # -- review found five distinct fence shapes (unclosed, nested, tilde
+    # -- vs backtick, indented, inside a list item) each defeated the
+    # -- toggle and let a real open task afterward pass as ticked, which is
+    # -- a silent allow on live work: the opposite of how this guard must
+    # -- fail. The owner's call: an example task inside a fence now counts
+    # -- as open. Over-blocking is the acceptable direction; silent
+    # -- allowing is not.
+    def test_open_task_like_line_inside_a_fenced_code_block_now_counts_as_open(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             init_repo(root)
             write_plan(
                 root, "PLAN.md",
-                "```\n- [ ] C1: example only, not real work\n```\n- [x] C2: done\n",
+                "```\n- [ ] C1: example only, not real work\n```\n",
             )
             write_marker(root, "PLAN.md")
             reason, note = hook.decide({}, root, NOW)
-            self.assertIsNone(reason)
+            self.assertIsNotNone(reason)
+
+    def test_unclosed_fence_before_a_real_open_task_still_blocks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            init_repo(root)
+            write_plan(
+                root, "PLAN.md",
+                "```\nexample text, never closed\n- [ ] C1: real work\n",
+            )
+            write_marker(root, "PLAN.md")
+            reason, note = hook.decide({}, root, NOW)
+            self.assertIsNotNone(reason)
+
+    def test_longer_fence_containing_a_shorter_one_still_blocks(self):
+        # A toggle-based detector flips its "inside a fence" flag once per
+        # fence-marker line regardless of length, so an outer ```` around a
+        # closed, shorter ``` pair leaves an ODD number of toggles (3) by
+        # the time the real task is reached, wrongly hiding it as the
+        # detector's single open task. This is the single-task-with-3-
+        # toggles shape a toggle-based approach cannot get right; removing
+        # fence-awareness entirely removes the shape as well.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            init_repo(root)
+            write_plan(
+                root, "PLAN.md",
+                "````\n```\n(inline content)\n```\n"
+                "- [ ] C1: real work, still logically inside the outer fence\n"
+                "````\n",
+            )
+            write_marker(root, "PLAN.md")
+            reason, note = hook.decide({}, root, NOW)
+            self.assertIsNotNone(reason)
+
+    def test_tilde_fence_containing_a_backtick_fence_still_blocks(self):
+        # Same odd-toggle shape as above, outer ~~~ around a closed ```.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            init_repo(root)
+            write_plan(
+                root, "PLAN.md",
+                "~~~\n```\n(inline content)\n```\n"
+                "- [ ] C1: real work, still logically inside the outer fence\n"
+                "~~~\n",
+            )
+            write_marker(root, "PLAN.md")
+            reason, note = hook.decide({}, root, NOW)
+            self.assertIsNotNone(reason)
+
+    def test_indented_fence_marker_still_blocks(self):
+        # An indented ``` still matches a toggle-based detector's fence
+        # pattern (it tolerates leading whitespace), so one unclosed,
+        # indented fence marker hides the one real task after it exactly
+        # as an unindented one would.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            init_repo(root)
+            write_plan(
+                root, "PLAN.md",
+                "  ```\n- [ ] C1: real work right after an indented fence line\n",
+            )
+            write_marker(root, "PLAN.md")
+            reason, note = hook.decide({}, root, NOW)
+            self.assertIsNotNone(reason)
+
+    def test_unclosed_fence_inside_a_list_item_still_blocks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            init_repo(root)
+            write_plan(
+                root, "PLAN.md",
+                "- Example:\n  ```\n  no closing fence here\n"
+                "- [ ] C1: real work\n",
+            )
+            write_marker(root, "PLAN.md")
+            reason, note = hook.decide({}, root, NOW)
+            self.assertIsNotNone(reason)
 
     # -- item 8: bounded output.
     def test_ids_list_capped_at_ten_with_exact_count(self):
@@ -486,6 +694,29 @@ class DecideTests(unittest.TestCase):
             self.assertIn("B1", reason)
             self.assertNotIn("B2", reason)
             self.assertNotIn("B3", reason)
+
+    # -- Round 3, item 7.
+    def test_open_tasks_with_no_capturable_ids_says_so(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            init_repo(root)
+            write_plan(root, "PLAN.md", "- [ ] notanid: lowercase only\n")
+            write_marker(root, "PLAN.md")
+            reason, note = hook.decide({}, root, NOW)
+            self.assertIsNotNone(reason)
+            self.assertIn("no task ids recognised", reason)
+
+    def test_id_length_cap_rejects_a_13_character_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            init_repo(root)
+            # 8 letters + 5 digits = 13 characters, one digit past the cap.
+            write_plan(root, "PLAN.md", "- [ ] ABCDEFGH12345: too many digits\n")
+            write_marker(root, "PLAN.md")
+            reason, note = hook.decide({}, root, NOW)
+            self.assertIsNotNone(reason)
+            self.assertNotIn("ABCDEFGH12345", reason)
+            self.assertIn("no task ids recognised", reason)
 
     # -- item 9: bounded reads.
     def test_oversized_plan_allows_with_stderr_note(self):
@@ -508,14 +739,28 @@ class DecideTests(unittest.TestCase):
             self.assertIsNone(reason)
             self.assertIsNone(note)
 
+    # -- Round 3, item 9: the marker gets the same BOM-stripping the note
+    # -- already had, and none of marker/plan/note decoding may raise on a
+    # -- stray non-UTF-8 byte (covered end to end in MainProcessTests).
+    def test_marker_strips_a_leading_utf8_bom(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            init_repo(root)
+            write_plan(root, "PLAN.md", "- [ ] C1: build the thing\n")
+            marker_dir = root / ".codex"
+            marker_dir.mkdir()
+            (marker_dir / "active-plan").write_bytes("﻿PLAN.md".encode("utf-8"))
+            reason, note = hook.decide({}, root, NOW)
+            self.assertIsNotNone(reason)
+            self.assertIn("C1", reason)
+
     def test_oversized_note_is_ignored_and_still_blocks(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             init_repo(root)
             write_plan(root, "PLAN.md", "- [ ] C1: build the thing\n")
             write_marker(root, "PLAN.md")
-            note = root / ".codex" / "blocked-on-human"
-            note.write_text("PLAN.md: " + ("x" * (1024 * 1024 + 10)))
+            write_note(root, "PLAN.md: " + ("x" * (1024 * 1024 + 10)), NOW)
             reason, _note = hook.decide({}, root, NOW)
             self.assertIsNotNone(reason)
 
@@ -691,17 +936,24 @@ class MainProcessTests(unittest.TestCase):
             self.assertIn("plan_guard_stop", result.stderr)
             self.assertIn("AttributeError", result.stderr)
 
-    def test_malformed_plan_encoding_allows_and_names_exception(self):
+    def test_stray_latin1_byte_in_the_plan_does_not_turn_off_the_hook(self):
+        # Round 3, item 9 supersedes this test's earlier shape: a decode
+        # error used to be the trigger for AC-OPS-13's "internal exception"
+        # coverage (kept elsewhere, via a malformed JSON payload), but the
+        # fix here is that a stray non-UTF-8 byte must NOT stop the guard
+        # from doing its job -- it must still read the real task and block.
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             init_repo(root)
-            marker = write_marker(root, "PLAN.md")
-            (root / "PLAN.md").write_bytes(b"\xff\xfe\x00 not valid utf-8")
+            write_marker(root, "PLAN.md")
+            (root / "PLAN.md").write_bytes(
+                "- [ ] C1: bad byte next \xe9 here\n".encode("latin-1")
+            )
             result = self.run_hook({"cwd": str(root)}, root)
             self.assertEqual(result.returncode, 0)
-            self.assertEqual(result.stdout, "")
-            self.assertIn("plan_guard_stop", result.stderr)
-            self.assertIn("UnicodeDecodeError", result.stderr)
+            decision = json.loads(result.stdout)
+            self.assertEqual(decision["decision"], "block")
+            self.assertIn("C1", decision["reason"])
 
     def test_missing_plan_names_marker_path_on_stderr_and_allows(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -730,6 +982,46 @@ class MainProcessTests(unittest.TestCase):
             self.assertEqual(decision["decision"], "block")
             self.assertNotIn("ignore previous instructions", result.stdout)
             self.assertNotIn("rm -rf", result.stdout)
+
+
+class BoundaryTests(unittest.TestCase):
+    """Round 3, item 8: pin the exact edges rather than trust the shape."""
+
+    def test_read_capped_accepts_exactly_the_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "f.txt"
+            path.write_bytes(b"a" * hook.MAX_READ_BYTES)
+            self.assertIsNotNone(hook.read_capped(path))
+
+    def test_read_capped_rejects_one_byte_over_the_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "f.txt"
+            path.write_bytes(b"a" * (hook.MAX_READ_BYTES + 1))
+            self.assertIsNone(hook.read_capped(path))
+
+    def test_marker_exists_above_finds_a_marker_two_levels_up(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".codex").mkdir()
+            (root / ".codex" / "active-plan").write_text("PLAN.md")
+            sub = root / "a" / "b"
+            sub.mkdir(parents=True)
+            self.assertTrue(hook.marker_exists_above(sub))
+
+    def test_repository_root_uses_the_configured_git_timeout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            init_repo(root)  # before patching, so this call is unaffected
+            captured = {}
+            real_run = subprocess.run
+
+            def fake_run(*args, **kwargs):
+                captured["timeout"] = kwargs.get("timeout")
+                return real_run(*args, **kwargs)
+
+            with unittest.mock.patch.object(subprocess, "run", side_effect=fake_run):
+                hook.repository_root(root)
+            self.assertEqual(captured.get("timeout"), hook.GIT_TIMEOUT_SECONDS)
 
 
 class HooksConfigTests(unittest.TestCase):
@@ -768,6 +1060,15 @@ class ConductPlanSkillTests(unittest.TestCase):
 
     def test_skill_says_to_replace_the_state_segment_not_add_to_it(self):
         self.assertIn("replac", self.skill_text.lower())
+
+    def test_skill_says_to_refresh_the_wait_stamp_on_each_reconcile(self):
+        # Round 3, item 2: a wait means "checked within the hour", so a CI
+        # queue or review lasting several hours needs its stamp refreshed
+        # each time reconcile confirms the wait is still live, not just
+        # recorded once at the start.
+        lowered = self.skill_flat.lower()
+        self.assertIn("refresh", lowered)
+        self.assertIn("reconcile", lowered)
 
 
 if __name__ == "__main__":
