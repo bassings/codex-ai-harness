@@ -1,0 +1,25 @@
+{
+  "name": "codex-ai-harness",
+  "version": "0.1.0",
+  "description": "Multi-lens planning, TDD, delivery, and review workflows for Codex.",
+  "author": {
+    "name": "Scott Bassingthwaighte-Hatch"
+  },
+  "repository": "https://github.com/bassings/codex-ai-harness",
+  "license": "MIT",
+  "keywords": ["planning", "review", "subagents", "tdd", "quality"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Codex AI Harness",
+    "shortDescription": "Parallel specialist planning and code review.",
+    "longDescription": "Plan, implement, and review changes with focused Codex subagents and acceptance criteria as the contract between stages.",
+    "developerName": "Scott Bassingthwaighte-Hatch",
+    "category": "Productivity",
+    "capabilities": ["Interactive", "Write"],
+    "defaultPrompt": [
+      "Run a plan cycle for this feature.",
+      "Review this branch with the specialist lenses.",
+      "Implement this task with a strict TDD loop."
+    ]
+  }
+}

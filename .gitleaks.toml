@@ -1,0 +1,15 @@
+# gitleaks configuration. Allowlist the EXACT value, never a path, and say why
+# it is not a secret and what would make that decision expire.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Values that look like credentials to an entropy check"
+regexTarget = "secret"
+regexes = [
+  # plugins/codex-ai-harness/hooks/pre_tool_use.py. The name of the escape
+  # hatch environment variable and the literal "1" it is compared against.
+  # EXPIRES IF: this value ever carries anything other than the flag name.
+  '''^HARNESS_ALLOW_DESTRUCTIVE_GIT=1$''',
+]

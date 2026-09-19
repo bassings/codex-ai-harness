@@ -1,0 +1,9 @@
+#!/bin/sh
+# The one command that says whether this repo passes. CI runs exactly this.
+set -e
+cd "$(dirname "$0")/.."
+# An empty discovery exits 0 on older Pythons, so assert the count first.
+count=$(python3 -c "import unittest; print(unittest.TestLoader().discover('plugins/codex-ai-harness/tests', pattern='test_*.py').countTestCases())")
+echo "verify: ${count} test(s) discovered"
+[ "${count:-0}" -ge 10 ]
+python3 -m unittest discover -s plugins/codex-ai-harness/tests -p 'test_*.py'

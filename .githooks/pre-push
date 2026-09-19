@@ -1,0 +1,12 @@
+#!/bin/sh
+# Pre-push gate: the full test suite, the same command CI runs.
+# Bypass only in a genuine emergency with `git push --no-verify`.
+set -e
+for _var in $(env | sed -n 's/^\(GIT_[A-Za-z0-9_]*\)=.*/\1/p'); do
+  case "$_var" in
+    GIT_AUTHOR_*|GIT_COMMITTER_*) ;;
+    *) unset "$_var" ;;
+  esac
+done
+cd "$(git rev-parse --show-toplevel)"
+exec bin/verify

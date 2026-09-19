@@ -1,0 +1,9 @@
+# Harness run state. Carries repo paths, timings and verdicts; never tracked.
+.codex/harness-ledger.jsonl
+.codex/optimise-cycle-report.md
+.codex/active-plan
+.codex/blocked-on-human
+
+__pycache__/
+*.pyc
+.DS_Store
