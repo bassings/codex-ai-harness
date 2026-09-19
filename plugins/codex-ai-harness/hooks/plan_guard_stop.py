@@ -125,7 +125,7 @@ def has_recent_wait(plan_text: str, now: dt.datetime) -> bool:
     return False
 
 
-def note_names_plan(cwd: Path, plan_rel: str) -> bool:
+def note_names_plan(root: Path, plan_rel: str) -> bool:
     """Whether .codex/blocked-on-human is live and declares this plan.
 
     Compared as the same repo-relative text the marker holds (AC-DATA-12
@@ -134,7 +134,7 @@ def note_names_plan(cwd: Path, plan_rel: str) -> bool:
     instructions carry the same repo-relative string, so a plain string
     match is the whole rule.
     """
-    note = cwd / NOTE_RELATIVE
+    note = root / NOTE_RELATIVE
     if note.is_symlink() or not note.is_file():
         return False
     text = note.read_text(encoding="utf-8")
@@ -150,7 +150,16 @@ def decide(payload: dict, cwd: Path, now: dt.datetime) -> tuple[str | None, str 
         # AC-C5-2: never block twice in a row.
         return None, None
 
-    marker = cwd / MARKER_RELATIVE
+    # Round-1 review finding: the marker and the note both live at the
+    # REPOSITORY root (that is what .codex/active-plan and conduct-plan's
+    # own instructions assume), never at cwd. A Codex session whose cwd is
+    # an ordinary subdirectory of the repo must still find them, so the
+    # root is resolved before either path is built, not after.
+    root = repository_root(cwd)
+    if root is None:
+        return None, None  # cannot place a marker against a repo; allow
+
+    marker = root / MARKER_RELATIVE
     if marker.is_symlink() or not marker.is_file():
         # No marker at all: AC-C5-3, silent. A symlinked marker: AC-SEC-12.
         return None, None
@@ -158,10 +167,6 @@ def decide(payload: dict, cwd: Path, now: dt.datetime) -> tuple[str | None, str 
     plan_rel = marker.read_text(encoding="utf-8").strip()
     if not plan_rel:
         return None, None  # malformed marker: nothing named, nothing to check
-
-    root = repository_root(cwd)
-    if root is None:
-        return None, None  # cannot place the plan against a repo; allow
 
     plan_path = resolve_within_root(root, plan_rel)
     if plan_path is None:
@@ -176,7 +181,7 @@ def decide(payload: dict, cwd: Path, now: dt.datetime) -> tuple[str | None, str 
     if not open_ids:
         return None, None  # all tasks ticked
 
-    if note_names_plan(cwd, plan_rel):
+    if note_names_plan(root, plan_rel):
         return None, None
 
     if has_recent_wait(plan_text, now):

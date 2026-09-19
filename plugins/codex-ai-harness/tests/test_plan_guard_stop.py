@@ -177,6 +177,38 @@ class DecideTests(unittest.TestCase):
             self.assertIsNone(reason)
             self.assertIsNone(note)
 
+    def test_marker_is_read_from_repository_root_when_cwd_is_a_subdirectory(self):
+        # An ordinary case: a Codex session's cwd is a subdirectory of the
+        # repo, not the root. The marker and plan still live at the root
+        # (that is what .codex/active-plan and conduct-plan both assume), so
+        # the guard must resolve the root first rather than looking for
+        # .codex/active-plan under cwd itself.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            init_repo(root)
+            write_plan(root, "PLAN.md", "- [ ] C1: build the thing\n")
+            write_marker(root, "PLAN.md")
+            sub = root / "sub" / "dir"
+            sub.mkdir(parents=True)
+            reason, note = hook.decide({}, sub, NOW)
+            self.assertIsNotNone(reason)
+            self.assertIn("C1", reason)
+
+    def test_marker_in_a_subdirectorys_own_dot_codex_is_ignored(self):
+        # The mirror image of the case above: a marker sitting under a
+        # subdirectory's own .codex/ is not the repository's marker and must
+        # not be read, even though it exists at cwd/.codex/active-plan.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            init_repo(root)
+            sub = root / "sub"
+            sub.mkdir()
+            write_plan(sub, "LOCAL-PLAN.md", "- [ ] C1: build the thing\n")
+            write_marker(sub, "LOCAL-PLAN.md")
+            reason, note = hook.decide({}, sub, NOW)
+            self.assertIsNone(reason)
+            self.assertIsNone(note)
+
     def test_symlinked_marker_allows(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
