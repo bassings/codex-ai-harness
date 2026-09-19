@@ -1,5 +1,17 @@
 {
   "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/hooks/plan_guard_stop.py\"",
+            "timeout": 10,
+            "statusMessage": "Checking whether a conducted plan still has open work"
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "Bash",
