@@ -30,15 +30,17 @@ durable source of truth; chat memory is not.
 5. After each material transition, update the task and append a terse dated
    conductor log entry. External writes such as pushes and PR creation require
    that the user's request includes that delivery scope.
-6. If waiting, use an available background wait or monitoring mechanism, keep
-   the task active, and record the wait by replacing the task's existing
-   `— state:` segment (not adding another one alongside it; only the newest
-   `(since <timestamp>)` on the line is honoured) with
-   `— state: <status> (since <UTC timestamp>)`, for example
-   `— state: awaiting-ci #12 (since 2026-09-19T05:10:00+00:00)`. Use the
-   current time with an explicit UTC offset (a trailing `Z`, or `+00:00`); a
-   timestamp with no offset at all is refused. This is the only place a wait
-   is recorded; write it every time a wait begins, not only the first time.
+6. A wait never ends the turn. Codex cannot wake this session once the turn
+   ends, so when a local gate, CI run, review, merge or scan is pending, keep
+   polling it within this turn (for example `gh pr checks <N> --watch` or a
+   bounded polling loop) until it reaches a terminal state, then update the
+   plan and take the next action. While a wait is live, record it by
+   replacing the task's existing `— state:` segment (not adding another one
+   alongside it) with `— state: <status> (since <UTC timestamp>)`, for example
+   `— state: awaiting-ci #12 (since 2026-09-19T05:10:00+00:00)`, and refresh
+   that stamp on every check so the plan shows when the wait was last
+   confirmed. A status question from the user is answered in passing, never
+   as a reason to end the turn.
    If a human decision is genuinely required, write `<plan path>: <question>`
    to `.codex/blocked-on-human` and ask exactly that question. The moment the
    human answers, delete `.codex/blocked-on-human` immediately, before acting
@@ -49,20 +51,22 @@ durable source of truth; chat memory is not.
    files and append a `conduct_plan_event` ledger event with outcome `done`.
 
 Never mark work complete merely because a command was launched. Report the
-measured state, action taken, and next wake condition.
+measured state and the action taken, then carry on with the next one.
 
 ## The Stop hook enforces this
 
 `hooks/plan_guard_stop.py` is a Codex Stop hook: it runs on every attempt to
 end a turn. While `.codex/active-plan` names this plan and it still has
-unticked open tasks, it refuses the stop unless the plan is genuinely
-covered: an open task's line carries a `(since <timestamp>)` wait recorded
-within the last hour, or `.codex/blocked-on-human` names this plan and is
-under a day old. So step 6 above is not optional housekeeping: an unrecorded
-wait or an unrecorded, undeleted human block means the next stop is refused.
-The hook reads only the active-plan marker, the blocked-on-human note and
-Codex's own `stop_hook_active` flag; it never reads the ledger, so nothing
-here depends on a ledger row being written.
+unticked open tasks, it refuses the stop unless `.codex/blocked-on-human`
+names this plan and is under a day old. A recorded wait does not exempt a
+stop. It refuses up to three times in a row; ticking a task or changing a
+task's state starts that count again (refreshing a wait stamp or adding a
+log line does not), and after three refusals with no such progress it lets
+the stop through and records a `stop_guard` fault in the ledger. No run of
+stop attempts is refused more than ten times in total, whatever the edits. Every
+refusal is recorded there too, so early stops are counted rather than
+self-reported. To pause a conducted plan deliberately, delete
+`.codex/active-plan`.
 
 ## The fix loop is bounded, and it escalates
 

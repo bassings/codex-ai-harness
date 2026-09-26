@@ -63,6 +63,14 @@ class PluginTests(unittest.TestCase):
             self.assertNotIn("free_text", item)
             self.assertNotEqual(item["run_id"], "quoted source or secret")
 
+    def test_ledger_accepts_stop_guard_rows(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            for outcome in ("blocked", "aborted"):
+                item = ledger.sanitize({"kind": "stop_guard", "outcome": outcome}, root)
+                self.assertEqual((item["kind"], item["outcome"]), ("stop_guard", outcome))
+
     def test_ledger_appends_one_ignored_json_line(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

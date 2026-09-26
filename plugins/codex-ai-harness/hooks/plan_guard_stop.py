@@ -1,35 +1,47 @@
 #!/usr/bin/env python3
 """Codex Stop hook: refuse to end a turn while a conducted plan still has
-open tasks, no recorded wait and no human block.
+open tasks and is not parked on a human decision.
 
-Scope, deliberately narrow (AC-SIMP-12): the decision comes from exactly
-three inputs -- the plan named by .codex/active-plan, the
-.codex/blocked-on-human note, and stop_hook_active. It never reads the
-harness's run-history file, so this file mentions none of that machinery;
-a wait is read from the named plan's own task line, not from any recorded
-history.
+Why a wait is not an exemption (2026-09-26): Codex has no equivalent of
+Claude Code's /loop, so nothing wakes a session once its turn ends. An
+earlier version let the turn end while an open task recorded a wait begun
+within the hour; in practice that was a licence to stop at every CI run,
+merge or scan and never come back. A pending external state is now
+something to keep polling within the turn, not a reason to stop.
 
-Root resolution below duplicates a few lines the harness's telemetry
-writer already has for the same purpose (git rev-parse --show-toplevel),
-rather than importing it. That import would put a word this file must
-not contain into its own source, so the small duplication is the price
-of the separation AC-SIMP-12 asks for. The marker and the note both live
-at the repository ROOT, never at cwd: a Codex session's cwd is often a
-subdirectory, so the root is resolved first and both paths are built
-under it.
+Why refusals are counted: Codex sets stop_hook_active on the stop attempt
+that follows a refusal, and an earlier version allowed any such attempt,
+so a second attempt always got out. The guard now refuses up to
+MAX_CONSECUTIVE_REFUSALS times in a row. A chain of refusals continues
+while Codex sets stop_hook_active, or while attempts arrive within
+CHAIN_WINDOW of the last refusal (so an immediate retry is still counted
+if Codex ever omits the flag); anything else starts a new chain, so a
+count left behind by an interrupted turn never shortens the next one. The count is keyed on a
+hash of the open task lines with their "(since ...)" stamps removed: a
+ticked task or a changed task state is progress and starts the count
+again, while refreshing a stamp or appending a log line is not, so an
+agent that keeps trying to stop without moving any task is let go after
+the limit, and that is recorded as a harness fault rather than passing
+silently. Rewording a task's state resets that count too, so a chain
+also has an overall cap, MAX_CHAIN_REFUSALS, that no plan edit resets:
+the hook can never hold a session indefinitely. The count lives in the git directory (never the working tree,
+so it can never be committed), is never written through a symlink, and if
+it cannot be kept at all the guard falls back to Codex's own
+stop_hook_active flag: one refusal, never an unbounded loop.
 
-Wait format this hook understands, on an open task's own line, replacing
-the line's existing "state:" segment rather than adding another one
-(only the latest usable "(since ...)" on a line is honoured, and one
-more than FUTURE_TOLERANCE ahead of now is discarded before that "latest"
-is chosen, so a leftover bogus future stamp cannot shadow a real one):
-    - [ ] C5: ... -- state: awaiting-ci #12 (since 2026-09-19T05:10:00+00:00)
-The timestamp needs an explicit UTC offset -- a trailing Z/z, "+00:00" or
-the bare "+0000" form, fractional seconds allowed -- and is refused if it
-carries no zone at all: with no zone there is no way to know how old it
-really is. A wait is live for one hour from that timestamp; a wait that
-is still live must be refreshed on every reconcile that confirms it, per
-conduct-plan's own instructions.
+Every refusal, and every time the guard gives way, appends one ledger row
+(kind stop_guard; counts only, plus the repo-relative plan path) through
+the harness's own ledger writer, so the optimiser can count early stops
+instead of relying on the agent to report them. The ledger is written,
+never read: the decision still comes only from the marker, the plan, the
+blocked-on-human note and the refusal count (AC-SIMP-12 as amended
+2026-09-26). A telemetry failure never changes the decision, and main()
+prints and flushes the decision before any telemetry is written, so a
+slow write cannot push the decision past the hook's timeout.
+
+The marker, note and plan live at the repository ROOT, never at cwd: a
+Codex session's cwd is often a subdirectory, so the root is resolved
+first and every path is built under it.
 
 The blocked-on-human note is ignored, the same as if it did not exist,
 once its age falls outside [-FUTURE_TOLERANCE, NOTE_MAX_AGE]: too old
@@ -53,8 +65,9 @@ should have blocked. An example task line inside a fence now simply
 counts as open instead: this can only over-block, never allow silently,
 which is the direction this guard is meant to fail in. A task's id --
 the only part of a task line ever echoed into a message -- is captured
-strictly and capped in length, per AC-SEC-12; when no open line yields a
-capturable id, the reason says so rather than rendering an empty list.
+strictly and capped in length, per AC-SEC-12, from either "T7: ..." or
+the bold "**T7 — ...**" form; when no open line yields a capturable id,
+the reason says so rather than rendering an empty list.
 
 Fails open throughout: a symlinked or unreadable marker or note, a plan
 path outside the repository root, a missing or oversized plan, a
@@ -68,6 +81,8 @@ to a replacement character rather than turning the guard off.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -78,7 +93,11 @@ import sys
 HOOK_NAME = "plan_guard_stop"
 MARKER_RELATIVE = Path(".codex") / "active-plan"
 NOTE_RELATIVE = Path(".codex") / "blocked-on-human"
-WAIT_WINDOW = dt.timedelta(hours=1)
+COUNTER_NAME = "codex-stop-guard.json"
+TELEMETRY_WRITER = Path(__file__).resolve().parents[1] / "scripts" / "ledger.py"
+MAX_CONSECUTIVE_REFUSALS = 3
+MAX_CHAIN_REFUSALS = 10
+CHAIN_WINDOW = dt.timedelta(minutes=2)
 NOTE_MAX_AGE = dt.timedelta(hours=24)
 FUTURE_TOLERANCE = dt.timedelta(minutes=5)
 MAX_READ_BYTES = 1024 * 1024
@@ -88,44 +107,31 @@ GIT_TIMEOUT_SECONDS = 2
 # how much of it is tried as a candidate path keeps a pathological note
 # (thousands of colons) from forcing thousands of filesystem resolutions.
 MAX_NOTE_COLON_ATTEMPTS = 200
+# Removed from task lines before hashing, so refreshing a wait stamp is not
+# mistaken for progress. Bounded so a pathological line cannot be slow.
+SINCE_RE = re.compile(r"\(since [^)\n]{0,64}\)")
 
 # Loose detection of an open checklist line: -, * or + or "1.", any
 # indentation. This decides whether the plan has open work at all.
 OPEN_TASK_LINE_RE = re.compile(r"^\s*(?:[-*+]|\d+\.)\s+\[ \]")
-# Strict id capture, applied only to lines the loose check already matched.
-# Bounded length (AC-SEC-12): the rest of the line -- description,
-# injected text, anything -- is never captured or echoed.
-ID_CAPTURE_RE = re.compile(r"^\s*(?:[-*+]|\d+\.)\s+\[ \]\s*([A-Z]{1,8}[0-9]{1,4}):")
-# Bounded capture group (round 3, item 5): an unterminated "(since" repeated
-# many times over a huge line must not make matching slow. 64 characters is
-# comfortably more than any accepted timestamp needs.
-SINCE_RE = re.compile(r"\(since ([^)\n]{0,64})\)")
-
-REJECTION_LABELS = {"future": "in the future", "invalid": "has no UTC offset"}
-REJECTION_ORDER = ("future", "invalid")
-
-
-def wait_clause(rejection_kinds: set[str]) -> str:
-    """The reason's opening clause about the plan's wait state.
-
-    Round 3, item 3: a "(since ...)" that was found but could not be used
-    (too far in the future, or missing its UTC offset) is reported as
-    such, distinct from a plan that simply never recorded a wait at all --
-    the two need different fixes and look identical without this.
-    """
-    if not rejection_kinds:
-        return "have no recorded wait"
-    labels = " / ".join(REJECTION_LABELS[k] for k in REJECTION_ORDER if k in rejection_kinds)
-    return f"have no live wait recorded (a wait stamp was found but rejected: {labels})"
-
+# Strict id capture, applied only to lines the loose check already matched:
+# "T7: ..." or the bold "**T7 — ...**" form. Bounded length (AC-SEC-12):
+# the rest of the line -- description, injected text, anything -- is
+# never captured or echoed.
+ID_CAPTURE_RE = re.compile(
+    r"^\s*(?:[-*+]|\d+\.)\s+\[ \]\s*(?:\*\*)?([A-Z]{1,8}[0-9]{1,4})(?::|\*\*|\s+[—–-]\s)"
+)
 
 REASON_TEMPLATE = (
-    "Codex plan guard: {count} open task(s) ({ids}) {wait_clause} and the "
-    "plan is not parked on a human decision. Record a wait by replacing "
-    'the open task\'s "state:" segment with, for example, "state: '
-    'awaiting-ci #1 (since 2026-09-19T05:55:00+00:00)"; write '
-    '.codex/blocked-on-human as "<plan path>: <question>"; or tick the '
-    "remaining tasks before stopping."
+    "Codex plan guard: {count} open task(s) ({ids}) and the plan is not "
+    "parked on a human decision (refusal {refusal} of {limit}). Codex cannot "
+    "wake this session once the turn ends, so a pending local gate, CI run, "
+    "review, merge or scan is not a reason to stop: keep polling it within "
+    "this turn until it reaches a terminal state, update the plan, then take "
+    "the next action. Stop only by ticking every task, or, when a human "
+    'decision is genuinely required, by writing .codex/blocked-on-human as '
+    '"<plan path>: <question>". After {limit} refusals with no task ticked or '
+    "changed state the stop is allowed and recorded as a harness fault."
 )
 
 
@@ -197,52 +203,6 @@ def read_capped(path: Path, limit: int = MAX_READ_BYTES) -> str | None:
     return path.read_text(encoding="utf-8", errors="replace")
 
 
-def parse_timestamp(raw: str) -> dt.datetime | None:
-    """Parse a "since" value; requires an explicit UTC offset.
-
-    Accepts what conduct-plan writes (a trailing Z, any case) plus the
-    common variants: a numeric offset with or without a colon, and
-    fractional seconds. A string with no zone at all parses fine as a
-    naive datetime, which is deliberately refused: without a zone there
-    is no way to know how old it actually is.
-    """
-    text = raw.strip()
-    if text.endswith(("Z", "z")):
-        text = text[:-1] + "+00:00"
-    bare_offset = re.match(r"^(.*[+-]\d{2})(\d{2})$", text)
-    if bare_offset:
-        text = f"{bare_offset.group(1)}:{bare_offset.group(2)}"
-    try:
-        parsed = dt.datetime.fromisoformat(text)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        return None
-    return parsed
-
-
-def evaluate_waits(line: str, now: dt.datetime) -> tuple[dt.datetime | None, set[str]]:
-    """The best usable "(since ...)" timestamp on this line, and the set
-    of rejection reasons ('future', 'invalid') among any that did not
-    produce one.
-
-    Round 3, item 3: a too-far-future candidate is discarded BEFORE the
-    max is taken, not after, so a leftover bogus future stamp cannot
-    shadow a real, fresh one recorded on the same line.
-    """
-    best: dt.datetime | None = None
-    rejected: set[str] = set()
-    for raw in SINCE_RE.findall(line):
-        parsed = parse_timestamp(raw)
-        if parsed is None:
-            rejected.add("invalid")
-            continue
-        if parsed - now > FUTURE_TOLERANCE:
-            rejected.add("future")
-            continue
-        if best is None or parsed > best:
-            best = parsed
-    return best, rejected
 
 
 def open_task_lines(plan_text: str) -> list[str]:
@@ -252,22 +212,6 @@ def open_task_lines(plan_text: str) -> list[str]:
     return [line for line in plan_text.splitlines() if OPEN_TASK_LINE_RE.match(line)]
 
 
-def has_recent_wait(open_lines: list[str], now: dt.datetime) -> bool:
-    """True when some open task's own line records a wait begun within
-    the last hour (AC-QA-22: 59 minutes counts, 61 minutes does not)."""
-    for line in open_lines:
-        since, _rejected = evaluate_waits(line, now)
-        if since is not None and dt.timedelta(0) <= now - since <= WAIT_WINDOW:
-            return True
-    return False
-
-
-def collect_rejections(open_lines: list[str], now: dt.datetime) -> set[str]:
-    rejections: set[str] = set()
-    for line in open_lines:
-        _since, rejected = evaluate_waits(line, now)
-        rejections |= rejected
-    return rejections
 
 
 def note_names_plan(root: Path, plan_path: Path, now: dt.datetime) -> bool:
@@ -325,11 +269,121 @@ def note_names_plan(root: Path, plan_path: Path, now: dt.datetime) -> bool:
     return False
 
 
-def decide(payload: dict, cwd: Path, now: dt.datetime) -> tuple[str | None, str | None]:
-    """Return (block_reason, stderr_note); both None is a silent allow."""
+def git_directory(root: Path) -> Path | None:
+    """This checkout's own git directory (per worktree), or None.
+
+    The refusal count lives here rather than under .codex/ so that it can
+    never be committed and needs no exclude entry.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--absolute-git-dir"],
+            cwd=root, text=True, capture_output=True,
+            timeout=GIT_TIMEOUT_SECONDS, check=True,
+        )
+        return Path(result.stdout.strip())
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def read_state(counter: Path) -> dict:
+    """The saved chain state; {} when the file is absent, a symlink,
+    unreadable or malformed."""
+    try:
+        if counter.is_symlink() or not counter.is_file():
+            return {}
+        data = json.loads(read_capped(counter, 4096) or "{}")
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def count_field(state: dict, key: str) -> int:
+    value = state.get(key)
+    return value if isinstance(value, int) and value > 0 else 0
+
+
+def chain_continues(state: dict, payload: dict, now: dt.datetime) -> bool:
+    """Whether this attempt belongs to the chain the saved state records:
+    Codex says so, or the last refusal was within CHAIN_WINDOW."""
     if payload.get("stop_hook_active"):
-        # AC-C5-2: never block twice in a row.
-        return None, None
+        return True
+    try:
+        last = dt.datetime.fromisoformat(str(state.get("last_refusal")))
+    except ValueError:
+        return False
+    if last.tzinfo is None:
+        return False
+    return dt.timedelta(0) <= now - last <= CHAIN_WINDOW
+
+
+def write_state(counter: Path, state: dict) -> bool:
+    """Record the state by writing a fresh file and renaming it over the
+    counter. The rename replaces a symlink rather than following it, and
+    the fresh file is opened with O_EXCL | O_NOFOLLOW. False on failure."""
+    staging = counter.with_name(f"{counter.name}.{os.getpid()}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(staging, flags, 0o600)
+        try:
+            os.write(fd, json.dumps(state).encode())
+        finally:
+            os.close(fd)
+        os.replace(staging, counter)
+        return True
+    except OSError:
+        try:
+            staging.unlink()
+        except OSError:
+            pass
+        return False
+
+
+def clear_refusals(counter: Path | None) -> None:
+    if counter is None:
+        return
+    try:
+        if counter.is_symlink() or counter.is_file():
+            counter.unlink()
+    except OSError:
+        pass
+
+
+def record(root: Path, plan_rel: str, outcome: str, counts: dict[str, int]) -> None:
+    """Append one stop_guard row through the harness's telemetry writer.
+
+    Loaded by path rather than imported, because the hook runs from the
+    plugin cache with no package on sys.path. Any failure is swallowed:
+    telemetry must never change the decision.
+    """
+    try:
+        spec = importlib.util.spec_from_file_location("codex_harness_telemetry", TELEMETRY_WRITER)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.ensure_excluded(root)
+        entry = module.sanitize(
+            {"kind": "stop_guard", "outcome": outcome, "spec": plan_rel, "counts": counts},
+            root,
+        )
+        module.append(entry, root)
+    except Exception as exc:  # noqa: BLE001 -- see docstring
+        print(f"{HOOK_NAME}: could not record telemetry ({type(exc).__name__})", file=sys.stderr)
+
+
+def decide(
+    payload: dict, cwd: Path, now: dt.datetime, deferred: list | None = None,
+) -> tuple[str | None, str | None]:
+    """Return (block_reason, stderr_note); both None is a silent allow.
+
+    Telemetry rows are written immediately, or appended to deferred as
+    argument tuples for record() when the caller wants to emit the decision
+    first (main() does).
+    """
+    def emit(*row) -> None:
+        if deferred is None:
+            record(*row)
+        else:
+            deferred.append(row)
 
     # The marker and the note both live at the REPOSITORY root (that is
     # what .codex/active-plan and conduct-plan's own instructions assume),
@@ -351,7 +405,7 @@ def decide(payload: dict, cwd: Path, now: dt.datetime) -> tuple[str | None, str 
     if marker_text is None:
         return None, None  # oversized marker: treated as malformed
 
-    plan_rel = marker_text.lstrip("﻿").strip()
+    plan_rel = marker_text.lstrip("\ufeff").strip()
     if not plan_rel:
         return None, None  # malformed marker: nothing named, nothing to check
 
@@ -367,15 +421,49 @@ def decide(payload: dict, cwd: Path, now: dt.datetime) -> tuple[str | None, str 
         return None, (f"{HOOK_NAME}: {marker} names a plan larger than "
                        f"{MAX_READ_BYTES} bytes; skipping it")
 
+    git_dir = git_directory(root)
+    counter = git_dir / COUNTER_NAME if git_dir is not None else None
+
     open_lines = open_task_lines(plan_text)
-    if not open_lines:
-        return None, None  # all tasks ticked (or none were ever open)
-
-    if note_names_plan(root, plan_path, now):
+    if not open_lines or note_names_plan(root, plan_path, now):
+        clear_refusals(counter)
         return None, None
 
-    if has_recent_wait(open_lines, now):
-        return None, None
+    plan_label = plan_path.relative_to(root).as_posix()
+    task_state = "\n".join(SINCE_RE.sub("", line).rstrip() for line in open_lines)
+    digest = hashlib.sha256(task_state.encode("utf-8", errors="replace")).hexdigest()
+    state = read_state(counter) if counter is not None else {}
+    if not chain_continues(state, payload, now):
+        state = {}
+    previous = count_field(state, "refusals") if state.get("plan_sha256") == digest else 0
+    chain_previous = count_field(state, "chain_refusals")
+    refusal = previous + 1
+
+    if refusal > MAX_CONSECUTIVE_REFUSALS or chain_previous + 1 > MAX_CHAIN_REFUSALS:
+        clear_refusals(counter)
+        emit(root, plan_label, "aborted",
+               {"open_tasks": len(open_lines), "refusals": previous})
+        return None, (f"{HOOK_NAME}: gave way after {chain_previous} refusals "
+                      f"({previous} with no task progress) on {plan_label}; recorded "
+                      "as a stop_guard fault")
+
+    note = None
+    new_state = {
+        "plan_sha256": digest, "refusals": refusal,
+        "chain_refusals": chain_previous + 1, "last_refusal": now.isoformat(),
+    }
+    if counter is None or not write_state(counter, new_state):
+        # Without a kept count the refusals cannot be bounded, so fall back
+        # to Codex's own flag: refuse once, never loop.
+        note = (f"{HOOK_NAME}: could not keep the refusal count; falling back "
+                "to a single refusal")
+        if payload.get("stop_hook_active"):
+            emit(root, plan_label, "aborted",
+                 {"open_tasks": len(open_lines), "refusals": 1})
+            return None, note
+
+    emit(root, plan_label, "blocked",
+           {"open_tasks": len(open_lines), "refusals": refusal})
 
     ids = sorted({
         match.group(1)
@@ -391,18 +479,19 @@ def decide(payload: dict, cwd: Path, now: dt.datetime) -> tuple[str | None, str 
         if remainder > 0:
             ids_display = f"{ids_display}, and {remainder} more"
 
-    rejections = collect_rejections(open_lines, now)
     reason = REASON_TEMPLATE.format(
-        count=len(open_lines), ids=ids_display, wait_clause=wait_clause(rejections),
+        count=len(open_lines), ids=ids_display,
+        refusal=refusal, limit=MAX_CONSECUTIVE_REFUSALS,
     )
-    return reason, None
+    return reason, note
 
 
 def main() -> int:
     try:
         payload = json.load(sys.stdin)
         cwd = Path(payload.get("cwd") or os.getcwd())
-        reason, note = decide(payload, cwd, dt.datetime.now(dt.timezone.utc))
+        deferred: list = []
+        reason, note = decide(payload, cwd, dt.datetime.now(dt.timezone.utc), deferred)
     except Exception as exc:  # a hook that cannot decide must never block
         print(f"{HOOK_NAME}: allowed the stop after an internal error "
               f"({type(exc).__name__})", file=sys.stderr)
@@ -411,6 +500,10 @@ def main() -> int:
         print(note, file=sys.stderr)
     if reason:
         print(json.dumps({"decision": "block", "reason": reason}))
+    sys.stdout.flush()
+    sys.stderr.flush()
+    for row in deferred:
+        record(*row)
     return 0
 
 
