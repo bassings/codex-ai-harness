@@ -1,6 +1,6 @@
 {
   "name": "codex-ai-harness",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Multi-lens planning, TDD, delivery, and review workflows for Codex.",
   "author": {
     "name": "Scott Bassingthwaighte-Hatch"
