@@ -735,7 +735,8 @@ class PersistenceTests(unittest.TestCase):
             open_plan(root)
             for _ in range(hook.MAX_CONSECUTIVE_REFUSALS + 1):
                 hook.decide({"stop_hook_active": True}, root, NOW)
-            reason, note = hook.decide({}, root, NOW)
+            self.assertFalse((root / ".git" / hook.COUNTER_NAME).exists())
+            reason, note = hook.decide({"stop_hook_active": True}, root, NOW)
             self.assertIsNotNone(reason)
             self.assertIn(f"refusal 1 of {hook.MAX_CONSECUTIVE_REFUSALS}", reason)
 
@@ -815,7 +816,7 @@ class PersistenceTests(unittest.TestCase):
             self.assertEqual(rows[0]["kind"], "stop_guard")
             self.assertEqual(rows[0]["outcome"], "blocked")
             self.assertEqual(rows[0]["spec"], "PLAN.md")
-            self.assertEqual(rows[0]["counts"], {"open_tasks": 2, "refusals": 1})
+            self.assertEqual(rows[0]["counts"], {"open_tasks": 2, "refusals": 1, "chain_refusals": 1})
             self.assertNotIn("ignore previous", json.dumps(rows))
 
     def test_giving_way_appends_an_aborted_ledger_row(self):
@@ -828,8 +829,10 @@ class PersistenceTests(unittest.TestCase):
             rows = read_ledger_rows(root)
             outcomes = [row["outcome"] for row in rows]
             self.assertEqual(outcomes, ["blocked"] * hook.MAX_CONSECUTIVE_REFUSALS + ["aborted"])
-            self.assertEqual(rows[-1]["counts"],
-                             {"open_tasks": 1, "refusals": hook.MAX_CONSECUTIVE_REFUSALS})
+            self.assertEqual(rows[-1]["counts"], {
+                "open_tasks": 1, "refusals": hook.MAX_CONSECUTIVE_REFUSALS,
+                "chain_refusals": hook.MAX_CONSECUTIVE_REFUSALS,
+            })
             self.assertEqual(rows[-1]["spec"], "PLAN.md")
 
     def test_an_allowed_stop_with_no_open_work_writes_no_ledger_row(self):
@@ -908,7 +911,13 @@ class PersistenceTests(unittest.TestCase):
                 plan.write_text(f"- [ ] C1: build — state: polling-ci {attempt}\n")
                 reason, note = hook.decide({"stop_hook_active": attempt > 0}, root, NOW)
                 results.append(reason is not None)
+                if reason is not None:
+                    last_reason = reason
             self.assertEqual(results, [True] * hook.MAX_CHAIN_REFUSALS + [False])
+            self.assertIn(f"{hook.MAX_CHAIN_REFUSALS} of {hook.MAX_CHAIN_REFUSALS} without a task ticked", last_reason)
+            aborted = read_ledger_rows(root)[-1]
+            self.assertEqual(aborted["outcome"], "aborted")
+            self.assertEqual(aborted["counts"]["chain_refusals"], hook.MAX_CHAIN_REFUSALS)
 
     def test_the_codex_flag_continues_a_chain_however_long_between_attempts(self):
         # An agent that polls for a long time between attempts is still in
@@ -1043,6 +1052,20 @@ class MainProcessTests(unittest.TestCase):
             result = self.run_hook({"cwd": str(root)}, root)
             self.assertEqual(result.returncode, 0)
             self.assertEqual(result.stdout, "")
+
+    def test_giving_way_writes_nothing_to_stdout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            init_repo(root)
+            open_plan(root)
+            results = [
+                self.run_hook({"cwd": str(root), "stop_hook_active": i > 0}, root)
+                for i in range(hook.MAX_CONSECUTIVE_REFUSALS + 1)
+            ]
+            self.assertTrue(all(json.loads(r.stdout)["decision"] == "block" for r in results[:-1]))
+            self.assertEqual(results[-1].returncode, 0)
+            self.assertEqual(results[-1].stdout, "")
+            self.assertIn("gave way", results[-1].stderr)
 
     def test_block_writes_valid_json_decision_to_stdout(self):
         with tempfile.TemporaryDirectory() as tmp:

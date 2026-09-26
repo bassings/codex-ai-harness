@@ -133,7 +133,8 @@ ID_CAPTURE_RE = re.compile(
 
 REASON_TEMPLATE = (
     "Codex plan guard: {count} open task(s) ({ids}) and the plan is not "
-    "parked on a human decision (refusal {refusal} of {limit}). Codex cannot "
+    "parked on a human decision (refusal {refusal} of {limit}; {chain} of "
+    "{chain_limit} without a task ticked). Codex cannot "
     "wake this session once the turn ends, so a pending local gate, CI run, "
     "review, merge or scan is not a reason to stop: keep polling it within "
     "this turn until it reaches a terminal state, update the plan, then take "
@@ -458,7 +459,8 @@ def decide(
     if refusal > MAX_CONSECUTIVE_REFUSALS or chain_previous + 1 > MAX_CHAIN_REFUSALS:
         clear_refusals(counter)
         emit(root, plan_label, "aborted",
-               {"open_tasks": len(open_lines), "refusals": previous})
+               {"open_tasks": len(open_lines), "refusals": previous,
+                "chain_refusals": chain_previous})
         return None, (f"{HOOK_NAME}: gave way after {chain_previous} refusals "
                       f"({previous} with no task progress) on {plan_label}; recorded "
                       "as a stop_guard fault")
@@ -475,11 +477,12 @@ def decide(
                 "to a single refusal")
         if payload.get("stop_hook_active"):
             emit(root, plan_label, "aborted",
-                 {"open_tasks": len(open_lines), "refusals": 1})
+                 {"open_tasks": len(open_lines), "refusals": 1, "chain_refusals": 1})
             return None, note
 
     emit(root, plan_label, "blocked",
-           {"open_tasks": len(open_lines), "refusals": refusal})
+           {"open_tasks": len(open_lines), "refusals": refusal,
+            "chain_refusals": chain_previous + 1})
 
     ids = sorted({
         match.group(1)
@@ -498,6 +501,7 @@ def decide(
     reason = REASON_TEMPLATE.format(
         count=len(open_lines), ids=ids_display,
         refusal=refusal, limit=MAX_CONSECUTIVE_REFUSALS,
+        chain=chain_previous + 1,
         chain_limit=MAX_CHAIN_REFUSALS,
     )
     return reason, note

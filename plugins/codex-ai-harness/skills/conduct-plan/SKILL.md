@@ -17,12 +17,9 @@ durable source of truth; chat memory is not.
    `.codex/active-plan`. Never put quoted findings or a human-block note in a
    tracked plan.
 3. Reconcile state from Git, open PRs, and CI before acting. Do not trust stale
-   status text in the plan when the external state disagrees. A wait means
-   "checked within the hour", not "checked once": each reconcile that
-   confirms an external wait (a CI run, a review) is still pending must
-   refresh its task's `(since <timestamp>)` stamp to the current time, per
-   step 6, so a queue or review lasting several hours is not mistaken for
-   one nobody is watching any more.
+   status text in the plan when the external state disagrees. Each reconcile
+   that confirms an external wait (a CI run, a review) is still pending
+   refreshes its task's `(since <timestamp>)` stamp, per step 6.
 4. Advance every independent unblocked task within the user's authority. Use
    `$tdd-task` for implementation and `$review-cycle` after CI is green.
    Parallelize read-only checks; use isolated worktrees and one writer per
