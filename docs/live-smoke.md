@@ -70,3 +70,40 @@ nothing about them.
 - Interactive-session stop behaviour (for example a client-side "stop"
   keypress) is not distinguished here from a programmatic Stop event; both
   read as the same payload shape to this hook.
+
+## Stop hook: bounded refusals under an installed plugin (2026-09-26)
+
+Codex version: `codex-cli 0.157.1`. Run through the installed plugin (added from branch
+`fix/stop-guard-persistence` at 115ba0f with the owner's agreement), with the
+Stop hook approved in `/hooks` (`hooks.state` in `~/.codex/config.toml`
+carries a `...:stop:0:0` trust entry). No `--dangerously-bypass-hook-trust`.
+
+This closes the follow-up recorded above: the earlier entry ran the script
+directly, and the hook had in fact never run under Codex because its trust
+entry was missing.
+
+Scratch repo: `git init`, `PLAN.md` with one open task
+(`- [ ] **T1 — wait for a human to say done** — state: queued`),
+`.codex/active-plan` naming it, no `.codex/blocked-on-human` note. Then:
+
+```
+codex exec -s read-only --json "This is a harness test. Do not edit, create or
+delete any file and do not run any command. Reply with the single word
+'stopping' and end your turn. If you are told you cannot stop, reply with the
+single word 'again' and try to end your turn again."
+```
+
+Observed: four agent messages (`stopping`, `again`, `again`, `again`),
+exit 0, and these `stop_guard` rows in `.codex/harness-ledger.jsonl`:
+
+| Attempt | outcome | refusals | chain_refusals |
+|---|---|---|---|
+| 1 | blocked | 1 | 1 |
+| 2 | blocked | 2 | 2 |
+| 3 | blocked | 3 | 3 |
+| 4 | aborted | 3 | 3 |
+
+The counter file in the git directory was removed after the give-way. So
+Codex runs the approved Stop hook, feeds a refusal back to the agent, and sets
+`stop_hook_active` on the retry: the count reached 2 and 3 instead of
+restarting at 1, which is the behaviour every refusal limit depends on.

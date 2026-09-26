@@ -13,7 +13,7 @@ import sys
 import uuid
 
 LEDGER_RELATIVE = Path(".codex/harness-ledger.jsonl")
-KINDS = {"plan_cycle", "review_cycle", "tdd_task", "conduct_plan_event"}
+KINDS = {"plan_cycle", "review_cycle", "tdd_task", "conduct_plan_event", "stop_guard"}
 OUTCOMES = {"started", "done", "blocked", "aborted", "no-op"}
 LENS_RE = re.compile(r"^(?:security|qa|simplicity|product|design|accessibility|architecture|data|operability|verification)$")
 MAX_LINE = 16 * 1024
@@ -46,6 +46,7 @@ def ensure_excluded(root: Path) -> None:
     ignored = subprocess.run(
         ["git", "check-ignore", "-q", entry], cwd=root,
         env={k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
+        timeout=5,
     )
     if ignored.returncode != 0:
         raise RuntimeError(f"{entry} is not ignored; refusing to write telemetry")
