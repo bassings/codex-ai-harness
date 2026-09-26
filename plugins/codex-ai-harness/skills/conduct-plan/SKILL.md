@@ -63,7 +63,9 @@ stop. It refuses up to three times in a row; ticking a task or changing a
 task's state starts that count again (refreshing a wait stamp or adding a
 log line does not), and after three refusals with no such progress it lets
 the stop through and records a `stop_guard` fault in the ledger. No run of
-stop attempts is refused more than ten times in total, whatever the edits. Every
+stop attempts is refused more than ten times in a row without a task being
+ticked; rewording a task's state, or ticking and unticking one, does not
+extend that. Every
 refusal is recorded there too, so early stops are counted rather than
 self-reported. To pause a conducted plan deliberately, delete
 `.codex/active-plan`.

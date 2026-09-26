@@ -13,18 +13,28 @@ Why refusals are counted: Codex sets stop_hook_active on the stop attempt
 that follows a refusal, and an earlier version allowed any such attempt,
 so a second attempt always got out. The guard now refuses up to
 MAX_CONSECUTIVE_REFUSALS times in a row. A chain of refusals continues
-while Codex sets stop_hook_active, or while attempts arrive within
-CHAIN_WINDOW of the last refusal (so an immediate retry is still counted
-if Codex ever omits the flag); anything else starts a new chain, so a
-count left behind by an interrupted turn never shortens the next one. The count is keyed on a
+only while Codex sets stop_hook_active; any attempt without it starts a
+new chain, so a count left behind by an interrupted turn never shortens
+the next one, however soon that turn's first stop attempt arrives. (An
+earlier version also continued a chain for two minutes after a refusal,
+which let a user's quick reply to an interrupted turn end that turn with
+no refusal at all.) The count is keyed on a
 hash of the open task lines with their "(since ...)" stamps removed: a
 ticked task or a changed task state is progress and starts the count
 again, while refreshing a stamp or appending a log line is not, so an
 agent that keeps trying to stop without moving any task is let go after
 the limit, and that is recorded as a harness fault rather than passing
 silently. Rewording a task's state resets that count too, so a chain
-also has an overall cap, MAX_CHAIN_REFUSALS, that no plan edit resets:
-the hook can never hold a session indefinitely. The count lives in the git directory (never the working tree,
+also has an overall cap, MAX_CHAIN_REFUSALS, that rewording cannot
+reset. Only real progress resets it: the chain records the lowest number
+of open tasks it has seen, and an attempt with fewer open tasks than that
+starts the overall count again and lowers the minimum. Because the
+minimum only ever goes down, ticking and unticking the same task buys
+nothing: a chain is released after MAX_CHAIN_REFUSALS refusals without
+its open count falling, so a plan whose agent ticks a task between
+attempts is never released with tasks open, and the hook still cannot
+hold a session indefinitely, since the open count can fall only so many
+times. The count lives in the git directory (never the working tree,
 so it can never be committed), is never written through a symlink, and if
 it cannot be kept at all the guard falls back to Codex's own
 stop_hook_active flag: one refusal, never an unbounded loop.
@@ -97,7 +107,6 @@ COUNTER_NAME = "codex-stop-guard.json"
 TELEMETRY_WRITER = Path(__file__).resolve().parents[1] / "scripts" / "ledger.py"
 MAX_CONSECUTIVE_REFUSALS = 3
 MAX_CHAIN_REFUSALS = 10
-CHAIN_WINDOW = dt.timedelta(minutes=2)
 NOTE_MAX_AGE = dt.timedelta(hours=24)
 FUTURE_TOLERANCE = dt.timedelta(minutes=5)
 MAX_READ_BYTES = 1024 * 1024
@@ -131,7 +140,8 @@ REASON_TEMPLATE = (
     "the next action. Stop only by ticking every task, or, when a human "
     'decision is genuinely required, by writing .codex/blocked-on-human as '
     '"<plan path>: <question>". After {limit} refusals with no task ticked or '
-    "changed state the stop is allowed and recorded as a harness fault."
+    "changed state, or {chain_limit} in a row with no task ticked, the stop "
+    "is allowed and recorded as a harness fault."
 )
 
 
@@ -303,18 +313,20 @@ def count_field(state: dict, key: str) -> int:
     return value if isinstance(value, int) and value > 0 else 0
 
 
-def chain_continues(state: dict, payload: dict, now: dt.datetime) -> bool:
+def lowest_open_tasks(state: dict) -> int | None:
+    """The lowest open-task count the chain has recorded, or None when the
+    field is missing or is anything but a positive integer (a bool is not
+    one, although Python counts it as an int)."""
+    value = state.get("min_open_tasks")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return None
+    return value
+
+
+def chain_continues(payload: dict) -> bool:
     """Whether this attempt belongs to the chain the saved state records:
-    Codex says so, or the last refusal was within CHAIN_WINDOW."""
-    if payload.get("stop_hook_active"):
-        return True
-    try:
-        last = dt.datetime.fromisoformat(str(state.get("last_refusal")))
-    except ValueError:
-        return False
-    if last.tzinfo is None:
-        return False
-    return dt.timedelta(0) <= now - last <= CHAIN_WINDOW
+    only when Codex says so."""
+    return bool(payload.get("stop_hook_active"))
 
 
 def write_state(counter: Path, state: dict) -> bool:
@@ -433,10 +445,14 @@ def decide(
     task_state = "\n".join(SINCE_RE.sub("", line).rstrip() for line in open_lines)
     digest = hashlib.sha256(task_state.encode("utf-8", errors="replace")).hexdigest()
     state = read_state(counter) if counter is not None else {}
-    if not chain_continues(state, payload, now):
+    if not chain_continues(payload):
         state = {}
     previous = count_field(state, "refusals") if state.get("plan_sha256") == digest else 0
     chain_previous = count_field(state, "chain_refusals")
+    lowest = lowest_open_tasks(state)
+    if lowest is not None and len(open_lines) < lowest:
+        chain_previous = 0  # fewer open tasks than ever in this chain: progress
+    lowest = len(open_lines) if lowest is None else min(lowest, len(open_lines))
     refusal = previous + 1
 
     if refusal > MAX_CONSECUTIVE_REFUSALS or chain_previous + 1 > MAX_CHAIN_REFUSALS:
@@ -450,7 +466,7 @@ def decide(
     note = None
     new_state = {
         "plan_sha256": digest, "refusals": refusal,
-        "chain_refusals": chain_previous + 1, "last_refusal": now.isoformat(),
+        "chain_refusals": chain_previous + 1, "min_open_tasks": lowest,
     }
     if counter is None or not write_state(counter, new_state):
         # Without a kept count the refusals cannot be bounded, so fall back
@@ -482,6 +498,7 @@ def decide(
     reason = REASON_TEMPLATE.format(
         count=len(open_lines), ids=ids_display,
         refusal=refusal, limit=MAX_CONSECUTIVE_REFUSALS,
+        chain_limit=MAX_CHAIN_REFUSALS,
     )
     return reason, note
 

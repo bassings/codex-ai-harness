@@ -842,15 +842,15 @@ class PersistenceTests(unittest.TestCase):
 
     def test_a_fresh_stop_attempt_ignores_a_count_left_by_an_earlier_turn(self):
         # A chain cut short (the user interrupts, the session dies) leaves a
-        # count behind; the next turn's first attempt must still be refused.
+        # count behind; the next turn's first attempt must still be refused,
+        # however soon it comes (AC-R4-1): the same instant, unchanged plan.
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             init_repo(root)
             open_plan(root)
             for _ in range(hook.MAX_CONSECUTIVE_REFUSALS):
                 hook.decide({"stop_hook_active": True}, root, NOW)
-            next_turn = NOW + hook.CHAIN_WINDOW + dt.timedelta(seconds=1)
-            reason, note = hook.decide({"stop_hook_active": False}, root, next_turn)
+            reason, note = hook.decide({"stop_hook_active": False}, root, NOW)
             self.assertIsNotNone(reason)
             self.assertIn(f"refusal 1 of {hook.MAX_CONSECUTIVE_REFUSALS}", reason)
 
@@ -910,32 +910,89 @@ class PersistenceTests(unittest.TestCase):
                 results.append(reason is not None)
             self.assertEqual(results, [True] * hook.MAX_CHAIN_REFUSALS + [False])
 
-    def test_a_quick_retry_continues_the_chain_even_without_the_codex_flag(self):
-        # If Codex ever omits stop_hook_active, an immediate retry must still
-        # count against the limit rather than restarting it forever.
+    def test_the_codex_flag_continues_a_chain_however_long_between_attempts(self):
+        # An agent that polls for a long time between attempts is still in
+        # the same chain when Codex says so.
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             init_repo(root)
             open_plan(root)
-            outcomes = [
-                hook.decide({}, root, NOW + dt.timedelta(seconds=10 * i))[0] is not None
-                for i in range(hook.MAX_CONSECUTIVE_REFUSALS + 1)
-            ]
-            self.assertEqual(outcomes, [True] * hook.MAX_CONSECUTIVE_REFUSALS + [False])
-
-    def test_the_codex_flag_continues_a_chain_past_the_time_window(self):
-        # An agent that polls for longer than CHAIN_WINDOW between attempts
-        # is still in the same chain when Codex says so.
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            init_repo(root)
-            open_plan(root)
-            gap = hook.CHAIN_WINDOW * 3
+            gap = dt.timedelta(minutes=30)
             outcomes = [
                 hook.decide({"stop_hook_active": i > 0}, root, NOW + gap * i)[0] is not None
                 for i in range(hook.MAX_CONSECUTIVE_REFUSALS + 1)
             ]
             self.assertEqual(outcomes, [True] * hook.MAX_CONSECUTIVE_REFUSALS + [False])
+
+    def test_a_plan_ticking_a_task_before_every_attempt_is_never_released(self):
+        # AC-R4-2: the chain cap exists to stop a stalled agent, not a
+        # progressing one; fourteen tasks outlast ten refusals.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            init_repo(root)
+            tasks = 14
+            self.assertGreater(tasks, hook.MAX_CHAIN_REFUSALS)
+            plan = open_plan(root)
+            for attempt in range(tasks):
+                plan.write_text("".join(
+                    f"- [{'x' if n < attempt else ' '}] T{n + 1}: task {n + 1}\n"
+                    for n in range(tasks)
+                ))
+                reason, note = hook.decide({"stop_hook_active": attempt > 0}, root, NOW)
+                self.assertIsNotNone(reason, f"attempt {attempt} with "
+                                     f"{tasks - attempt} open should block (note: {note})")
+            plan.write_text("".join(f"- [x] T{n + 1}: task {n + 1}\n" for n in range(tasks)))
+            self.assertEqual(hook.decide({"stop_hook_active": True}, root, NOW), (None, None))
+
+    def test_toggling_a_tick_cannot_extend_a_chain_forever(self):
+        # AC-R4-3: the lowest open count in a chain only goes down, so
+        # ticking, unticking and rewording state never buys more refusals.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            init_repo(root)
+            plan = open_plan(root)
+            results = []
+            for attempt in range(hook.MAX_CHAIN_REFUSALS + 1):
+                tick = "x" if attempt % 2 == 0 else " "
+                plan.write_text(f"- [{tick}] C1: build\n"
+                                f"- [ ] C2: ship — state: polling-ci {attempt}\n")
+                reason, note = hook.decide({"stop_hook_active": attempt > 0}, root, NOW)
+                results.append(reason is not None)
+            self.assertEqual(results, [True] * hook.MAX_CHAIN_REFUSALS + [False])
+
+    def test_a_malformed_lowest_open_count_is_treated_as_absent(self):
+        # Treated as absent, the first attempt records 3 as the lowest open
+        # count, so ticking one task resets the chain cap and the second
+        # attempt is refused. Misread as a number of 2 or less, it would not
+        # reset and the second attempt would be let go; a string would crash.
+        for value in ("missing", -1, 0.5, "3", True, False, None, [3]):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                init_repo(root)
+                plan = open_plan(root, "- [ ] C1: a\n- [ ] C2: b\n- [ ] C3: c\n")
+                state = {"refusals": 1, "chain_refusals": hook.MAX_CHAIN_REFUSALS - 1}
+                if value != "missing":
+                    state["min_open_tasks"] = value
+                (root / ".git" / hook.COUNTER_NAME).write_text(json.dumps(state))
+                first, _ = hook.decide({"stop_hook_active": True}, root, NOW)
+                plan.write_text("- [x] C1: a\n- [ ] C2: b\n- [ ] C3: c\n")
+                second, note = hook.decide({"stop_hook_active": True}, root, NOW)
+                self.assertIsNotNone(first)
+                self.assertIsNotNone(second, note)
+
+    def test_reason_names_both_refusal_limits(self):
+        # AC-R4-4
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            init_repo(root)
+            open_plan(root)
+            reason, note = hook.decide({}, root, NOW)
+            self.assertIn(
+                f"After {hook.MAX_CONSECUTIVE_REFUSALS} refusals with no task ticked or "
+                f"changed state, or {hook.MAX_CHAIN_REFUSALS} in a row with no task "
+                "ticked, the stop is allowed and recorded as a harness fault.",
+                reason,
+            )
 
     def test_since_stripping_stays_fast_on_a_huge_unterminated_pattern(self):
         with tempfile.TemporaryDirectory() as tmp:
