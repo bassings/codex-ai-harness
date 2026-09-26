@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Bundled hook commands now find an installed harness copy when Codex keeps an
+  active session's old plugin root after an upgrade removes that cache entry.
+  This keeps both the Stop plan guard and the PreToolUse Git guard available
+  until a new session loads the updated plugin.
+
 ## 0.2.0 (2026-09-26)
 
 ### Fixed

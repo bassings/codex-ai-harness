@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${PLUGIN_ROOT}/hooks/plan_guard_stop.py\"",
+            "command": "python3 -c 'import os,pathlib,runpy,sys; root=pathlib.Path(os.environ[\"PLUGIN_ROOT\"]); name=sys.argv[1]; own=root/\"hooks\"/name; fallback=(p for p in root.parent.glob(\"*/hooks/\"+name) if p.is_file() and not p.is_symlink()); target=own if own.is_file() and not own.is_symlink() else max(fallback,key=lambda p:p.parent.parent.stat().st_mtime,default=None); target or sys.exit(\"Codex AI Harness hook unavailable: \"+name); sys.path.insert(0,str(target.parent)); runpy.run_path(str(target),run_name=\"__main__\")' plan_guard_stop.py",
             "timeout": 10,
             "statusMessage": "Checking whether a conducted plan still has open work"
           }
@@ -18,7 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${PLUGIN_ROOT}/hooks/pre_tool_use.py\"",
+            "command": "python3 -c 'import os,pathlib,runpy,sys; root=pathlib.Path(os.environ[\"PLUGIN_ROOT\"]); name=sys.argv[1]; own=root/\"hooks\"/name; fallback=(p for p in root.parent.glob(\"*/hooks/\"+name) if p.is_file() and not p.is_symlink()); target=own if own.is_file() and not own.is_symlink() else max(fallback,key=lambda p:p.parent.parent.stat().st_mtime,default=None); target or sys.exit(\"Codex AI Harness hook unavailable: \"+name); sys.path.insert(0,str(target.parent)); runpy.run_path(str(target),run_name=\"__main__\")' pre_tool_use.py",
             "timeout": 3,
             "statusMessage": "Snapshotting tracked changes and checking destructive Git"
           }

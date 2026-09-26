@@ -4,6 +4,7 @@ import importlib.util
 import contextlib
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -27,6 +28,56 @@ hook = load("pre_tool_use", ROOT / "hooks" / "pre_tool_use.py")
 
 
 class PluginTests(unittest.TestCase):
+    def test_hook_commands_survive_a_removed_active_cache_version(self):
+        hooks = json.loads((ROOT / "hooks" / "hooks.json").read_text())["hooks"]
+        with tempfile.TemporaryDirectory() as temp:
+            cache = Path(temp)
+            stale_root = cache / "0.1.0"
+            current_hooks = cache / "0.2.0" / "hooks"
+            current_hooks.mkdir(parents=True)
+            for event, filename in (
+                ("Stop", "plan_guard_stop.py"),
+                ("PreToolUse", "pre_tool_use.py"),
+            ):
+                (current_hooks / filename).write_text(
+                    "import sys\n"
+                    f"print({event!r})\n"
+                    "assert sys.stdin.read() == '{}'\n"
+                )
+                env = {**os.environ, "PLUGIN_ROOT": str(stale_root)}
+                command = hooks[event][0]["hooks"][0]["command"]
+                with self.subTest(event=event):
+                    result = subprocess.run(
+                        command, shell=True, input="{}", text=True,
+                        capture_output=True, env=env,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, event + "\n")
+
+    def test_hook_commands_keep_the_active_copy_when_it_exists(self):
+        hooks = json.loads((ROOT / "hooks" / "hooks.json").read_text())["hooks"]
+        with tempfile.TemporaryDirectory() as temp:
+            cache = Path(temp)
+            active = cache / "0.1.0" / "hooks"
+            newer = cache / "0.2.0" / "hooks"
+            active.mkdir(parents=True)
+            newer.mkdir(parents=True)
+            for event, filename in (
+                ("Stop", "plan_guard_stop.py"),
+                ("PreToolUse", "pre_tool_use.py"),
+            ):
+                (active / filename).write_text("print('active')\n")
+                (newer / filename).write_text("print('newer')\n")
+                env = {**os.environ, "PLUGIN_ROOT": str(active.parent)}
+                command = hooks[event][0]["hooks"][0]["command"]
+                with self.subTest(event=event):
+                    result = subprocess.run(
+                        command, shell=True, text=True, capture_output=True,
+                        env=env,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, "active\n")
+
     def test_manifest_and_every_skill_are_complete(self):
         manifest = json.loads((ROOT / ".codex-plugin" / "plugin.json").read_text())
         self.assertEqual(manifest["name"], "codex-ai-harness")
